@@ -1,0 +1,28 @@
+# Build
+build/
+cmake-build-*/
+out/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+._*
+
+# Output images
+*.png
+*.bmp
+*.tga
+
+# Temp files
+.____*
+
+# Project specific
+.msc
+.mv
+z-image-turbo/

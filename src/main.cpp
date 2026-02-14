@@ -105,6 +105,7 @@ static void print_usage()
     fprintf(stdout, "  -l steps             denoise steps (default=auto)\n");
     fprintf(stdout, "  -r random-seed       random seed (default=rand)\n");
     fprintf(stdout, "  -m model-path        z-image model path (default=z-image-turbo)\n");
+    fprintf(stdout, "  -c count             number of images to generate (default=1)\n");
     fprintf(stdout, "  -g gpu-id            gpu device to use (-1=cpu, default=auto)\n");
 }
 
@@ -123,6 +124,7 @@ int main(int argc, char** argv)
     int height = 1024;
     int steps = -1;
     int seed = rand();
+    int count = 1;
     path_t model = PATHSTR("z-image-turbo");
     int gpuid = 233;
 
@@ -131,7 +133,7 @@ int main(int argc, char** argv)
 #if _WIN32
         setlocale(LC_ALL, "");
         wchar_t opt;
-        while ((opt = getopt(argc, argv, L"p:n:o:s:l:r:m:g:h")) != (wchar_t)-1)
+        while ((opt = getopt(argc, argv, L"p:n:o:s:l:r:m:c:g:h")) != (wchar_t)-1)
         {
             switch (opt)
             {
@@ -162,6 +164,9 @@ int main(int argc, char** argv)
             case L'r':
                 seed = _wtoi(optarg);
                 break;
+            case L'c':
+                count = _wtoi(optarg);
+                break;
             case L'm':
                 model = optarg;
                 break;
@@ -176,7 +181,7 @@ int main(int argc, char** argv)
         }
 #else // _WIN32
         int opt;
-        while ((opt = getopt(argc, argv, "p:n:o:s:l:r:m:g:h")) != -1)
+        while ((opt = getopt(argc, argv, "p:n:o:s:l:r:m:c:g:h")) != -1)
         {
             switch (opt)
             {
@@ -207,6 +212,9 @@ int main(int argc, char** argv)
             case 'r':
                 seed = atoi(optarg);
                 break;
+            case 'c':
+                count = atoi(optarg);
+                break;
             case 'm':
                 model = optarg;
                 break;
@@ -220,6 +228,12 @@ int main(int argc, char** argv)
             }
         }
 #endif // _WIN32
+    }
+
+    if (count < 1)
+    {
+        fprintf(stderr, "count must be >= 1 but got %d\n", count);
+        return -1;
     }
 
     if (prompt.empty() || outpath.empty())
@@ -289,6 +303,7 @@ int main(int argc, char** argv)
     fprintf(stderr, "image-size = %d x %d\n", width, height);
     fprintf(stderr, "steps = %d\n", steps);
     fprintf(stderr, "seed = %d\n", seed);
+    fprintf(stderr, "count = %d\n", count);
     fprintf(stderr, "gpu-id = %d\n", gpuid);
 
     const bool apply_cfg = guidance_scale > 0.f;
@@ -420,10 +435,6 @@ int main(int argc, char** argv)
         }
     }
 
-    // patchify
-    ncnn::Mat x;
-    ZImage::patchify(latent, x);
-
     // prepare timesteps
     std::vector<float> sigmas;
     std::vector<float> timesteps;
@@ -438,6 +449,17 @@ int main(int argc, char** argv)
 
         t_embedder.process(timesteps, t_embeds);
     }
+
+    // generate seeds for multi-image
+    std::vector<int> seeds(count);
+    seeds[0] = seed;
+    for (int i = 1; i < count; i++)
+    {
+        seeds[i] = seed + (rand() % 10001 - 5000);
+    }
+
+    // store latent results for all images
+    std::vector<ncnn::Mat> result_latents(count);
 
     // diffusion transformer loop
     {
@@ -457,89 +479,98 @@ int main(int argc, char** argv)
 
         all_final_layer.load(model, opt);
 
-        for (int z = 0; z < steps; z++)
+        for (int img_idx = 0; img_idx < count; img_idx++)
         {
-            ncnn::Mat t_embed = t_embeds.row_range(z, 1).clone();
+            int current_seed = seeds[img_idx];
+            fprintf(stderr, "\n[%d/%d] generating with seed = %d\n", img_idx + 1, count, current_seed);
 
-            // all_x_embedder
-            ncnn::Mat x_embed;
-            all_x_embedder.process(x, x_embed);
+            // prepare latent
+            ncnn::Mat img_latent;
+            ZImage::generate_latent(width, height, current_seed, img_latent);
 
-            // noise_refiner
-            ncnn::Mat x_embed_refine;
-            noise_refiner.process(x_embed, x_cos, x_sin, t_embed, x_embed_refine);
+            // patchify
+            ncnn::Mat x;
+            ZImage::patchify(img_latent, x);
 
-            // concat x_embed_refine and cap_refine
-            ncnn::Mat unified_embed;
-            ZImage::concat_along_h(x_embed_refine, cap_refine, unified_embed);
-
-            ncnn::Mat neg_unified_embed;
-            if (apply_cfg)
+            for (int z = 0; z < steps; z++)
             {
-                ZImage::concat_along_h(x_embed_refine, neg_cap_refine, neg_unified_embed);
-            }
+                ncnn::Mat t_embed = t_embeds.row_range(z, 1).clone();
 
-            // unified
-            ncnn::Mat unified;
-            unified_refiner.process(unified_embed, unified_cos, unified_sin, t_embed, unified);
+                // all_x_embedder
+                ncnn::Mat x_embed;
+                all_x_embedder.process(x, x_embed);
 
-            ncnn::Mat neg_unified;
-            if (apply_cfg)
-            {
-                unified_refiner.process(neg_unified_embed, neg_unified_cos, neg_unified_sin, t_embed, neg_unified);
-            }
+                // noise_refiner
+                ncnn::Mat x_embed_refine;
+                noise_refiner.process(x_embed, x_cos, x_sin, t_embed, x_embed_refine);
 
-            // all_final_layer
-            ncnn::Mat unified_final;
-            all_final_layer.process(unified, t_embed, unified_final);
+                // concat x_embed_refine and cap_refine
+                ncnn::Mat unified_embed;
+                ZImage::concat_along_h(x_embed_refine, cap_refine, unified_embed);
 
-            ncnn::Mat neg_unified_final;
-            if (apply_cfg)
-            {
-                all_final_layer.process(neg_unified, t_embed, neg_unified_final);
-            }
-
-            if (apply_cfg)
-            {
-                // apply cfg
-                const int total = x.total();
-                for (int i = 0; i < total; i++)
+                ncnn::Mat neg_unified_embed;
+                if (apply_cfg)
                 {
-                    float pos = unified_final[i];
-                    float neg = neg_unified_final[i];
-
-                    unified_final[i] = pos + guidance_scale * (pos - neg);
+                    ZImage::concat_along_h(x_embed_refine, neg_cap_refine, neg_unified_embed);
                 }
-            }
 
-            // euler scheduler step
-            {
-                const float dt = sigmas[z + 1] - sigmas[z];
+                // unified
+                ncnn::Mat unified;
+                unified_refiner.process(unified_embed, unified_cos, unified_sin, t_embed, unified);
 
-                const int total = x.total();
-                for (int i = 0; i < total; i++)
+                ncnn::Mat neg_unified;
+                if (apply_cfg)
                 {
-                    x[i] = x[i] - dt * unified_final[i];
+                    unified_refiner.process(neg_unified_embed, neg_unified_cos, neg_unified_sin, t_embed, neg_unified);
                 }
+
+                // all_final_layer
+                ncnn::Mat unified_final;
+                all_final_layer.process(unified, t_embed, unified_final);
+
+                ncnn::Mat neg_unified_final;
+                if (apply_cfg)
+                {
+                    all_final_layer.process(neg_unified, t_embed, neg_unified_final);
+                }
+
+                if (apply_cfg)
+                {
+                    // apply cfg
+                    const int total = x.total();
+                    for (int i = 0; i < total; i++)
+                    {
+                        float pos = unified_final[i];
+                        float neg = neg_unified_final[i];
+
+                        unified_final[i] = pos + guidance_scale * (pos - neg);
+                    }
+                }
+
+                // euler scheduler step
+                {
+                    const float dt = sigmas[z + 1] - sigmas[z];
+
+                    const int total = x.total();
+                    for (int i = 0; i < total; i++)
+                    {
+                        x[i] = x[i] - dt * unified_final[i];
+                    }
+                }
+
+                fprintf(stderr, "[%d/%d] step %d done\n", img_idx + 1, count, z);
             }
 
-            fprintf(stderr, "step %d done\n", z);
+            // unpatchify
+            ZImage::unpatchify(x, img_latent);
+            result_latents[img_idx] = img_latent;
         }
     }
 
-    // unpatchify
-    ZImage::unpatchify(x, latent);
-
-    // vae decode
-    ncnn::Mat outimage;
+    // vae decode and save all images
     {
         const float vae_scaling_factor = 0.3611f;
         const float vae_shift_factor = 0.1159f;
-
-        for (int i = 0; i < latent.total(); i++)
-        {
-            latent[i] = latent[i] / vae_scaling_factor + vae_shift_factor;
-        }
 
         const bool use_vae_tiled = vae_tile_width < width || vae_tile_height < height;
 
@@ -547,50 +578,90 @@ int main(int argc, char** argv)
 
         vae.load(model, use_vae_tiled, opt);
 
-        if (use_vae_tiled)
+        for (int img_idx = 0; img_idx < count; img_idx++)
         {
-            vae.process_tiled(latent, vae_tile_width, vae_tile_height, outimage);
-        }
-        else
-        {
-            vae.process(latent, outimage);
-        }
-    }
+            ncnn::Mat& img_latent = result_latents[img_idx];
 
-    // save image
-    {
-        int success = 0;
+            for (int i = 0; i < img_latent.total(); i++)
+            {
+                img_latent[i] = img_latent[i] / vae_scaling_factor + vae_shift_factor;
+            }
 
-        path_t ext = get_file_extension(outpath);
+            ncnn::Mat outimage;
+            if (use_vae_tiled)
+            {
+                vae.process_tiled(img_latent, vae_tile_width, vae_tile_height, outimage);
+            }
+            else
+            {
+                vae.process(img_latent, outimage);
+            }
 
-        if (ext == PATHSTR("webp") || ext == PATHSTR("WEBP"))
-        {
-            success = webp_save(outpath.c_str(), outimage.w, outimage.h, outimage.elempack, (const unsigned char*)outimage.data);
-        }
-        else if (ext == PATHSTR("png") || ext == PATHSTR("PNG"))
-        {
+            // generate output path for this image
+            path_t img_outpath;
+            if (count == 1)
+            {
+                img_outpath = outpath;
+            }
+            else
+            {
+                path_t name = get_file_name_without_extension(outpath);
+                path_t ext = get_file_extension(outpath);
 #if _WIN32
-            success = wic_encode_image(outpath.c_str(), outimage.w, outimage.h, outimage.elempack, outimage.data);
+                wchar_t suffix[64];
+                swprintf(suffix, 64, L"_%d.%ls", seeds[img_idx], ext.c_str());
+                img_outpath = name + suffix;
 #else
-            success = png_save(outpath.c_str(), outimage.w, outimage.h, outimage.elempack, (const unsigned char*)outimage.data);
+                char suffix[64];
+                snprintf(suffix, 64, "_%d.%s", seeds[img_idx], ext.c_str());
+                img_outpath = name + suffix;
 #endif
-        }
-        else if (ext == PATHSTR("jpg") || ext == PATHSTR("JPG") || ext == PATHSTR("jpeg") || ext == PATHSTR("JPEG"))
-        {
-#if _WIN32
-            success = wic_encode_jpeg_image(outpath.c_str(), outimage.w, outimage.h, outimage.elempack, outimage.data);
-#else
-            success = jpeg_save(outpath.c_str(), outimage.w, outimage.h, outimage.elempack, (const unsigned char*)outimage.data);
-#endif
-        }
+            }
 
-        if (!success)
-        {
+            // save image
+            {
+                int success = 0;
+
+                path_t ext = get_file_extension(img_outpath);
+
+                if (ext == PATHSTR("webp") || ext == PATHSTR("WEBP"))
+                {
+                    success = webp_save(img_outpath.c_str(), outimage.w, outimage.h, outimage.elempack, (const unsigned char*)outimage.data);
+                }
+                else if (ext == PATHSTR("png") || ext == PATHSTR("PNG"))
+                {
 #if _WIN32
-            fwprintf(stderr, L"encode image %ls failed\n", outpath.c_str());
+                    success = wic_encode_image(img_outpath.c_str(), outimage.w, outimage.h, outimage.elempack, outimage.data);
 #else
-            fprintf(stderr, "encode image %s failed\n", outpath.c_str());
+                    success = png_save(img_outpath.c_str(), outimage.w, outimage.h, outimage.elempack, (const unsigned char*)outimage.data);
 #endif
+                }
+                else if (ext == PATHSTR("jpg") || ext == PATHSTR("JPG") || ext == PATHSTR("jpeg") || ext == PATHSTR("JPEG"))
+                {
+#if _WIN32
+                    success = wic_encode_jpeg_image(img_outpath.c_str(), outimage.w, outimage.h, outimage.elempack, outimage.data);
+#else
+                    success = jpeg_save(img_outpath.c_str(), outimage.w, outimage.h, outimage.elempack, (const unsigned char*)outimage.data);
+#endif
+                }
+
+                if (!success)
+                {
+#if _WIN32
+                    fwprintf(stderr, L"encode image %ls failed\n", img_outpath.c_str());
+#else
+                    fprintf(stderr, "encode image %s failed\n", img_outpath.c_str());
+#endif
+                }
+                else
+                {
+#if _WIN32
+                    fwprintf(stderr, L"[%d/%d] saved %ls\n", img_idx + 1, count, img_outpath.c_str());
+#else
+                    fprintf(stderr, "[%d/%d] saved %s\n", img_idx + 1, count, img_outpath.c_str());
+#endif
+                }
+            }
         }
     }
 
