@@ -105,6 +105,7 @@ static void print_usage()
     fprintf(stdout, "  -l steps             denoise steps (default=auto)\n");
     fprintf(stdout, "  -r random-seed       random seed (default=rand)\n");
     fprintf(stdout, "  -m model-path        z-image model path (default=z-image-turbo)\n");
+    fprintf(stdout, "  -c count             number of images to generate (default=1)\n");
     fprintf(stdout, "  -g gpu-id            gpu device to use (-1=cpu, default=auto)\n");
 }
 
@@ -123,6 +124,7 @@ int main(int argc, char** argv)
     int height = 1024;
     int steps = -1;
     int seed = rand();
+    int count = 1;
     path_t model = PATHSTR("z-image-turbo");
     int gpuid = 233;
 
@@ -131,7 +133,7 @@ int main(int argc, char** argv)
 #if _WIN32
         setlocale(LC_ALL, "");
         wchar_t opt;
-        while ((opt = getopt(argc, argv, L"p:n:o:s:l:r:m:g:h")) != (wchar_t)-1)
+        while ((opt = getopt(argc, argv, L"p:n:o:s:l:r:m:c:g:h")) != (wchar_t)-1)
         {
             switch (opt)
             {
@@ -165,6 +167,9 @@ int main(int argc, char** argv)
             case L'm':
                 model = optarg;
                 break;
+            case L'c':
+                count = _wtoi(optarg);
+                break;
             case L'g':
                 gpuid = _wtoi(optarg);
                 break;
@@ -176,7 +181,7 @@ int main(int argc, char** argv)
         }
 #else // _WIN32
         int opt;
-        while ((opt = getopt(argc, argv, "p:n:o:s:l:r:m:g:h")) != -1)
+        while ((opt = getopt(argc, argv, "p:n:o:s:l:r:m:c:g:h")) != -1)
         {
             switch (opt)
             {
@@ -210,6 +215,9 @@ int main(int argc, char** argv)
             case 'm':
                 model = optarg;
                 break;
+            case 'c':
+                count = atoi(optarg);
+                break;
             case 'g':
                 gpuid = atoi(optarg);
                 break;
@@ -220,6 +228,12 @@ int main(int argc, char** argv)
             }
         }
 #endif // _WIN32
+    }
+
+    if (count < 1)
+    {
+        fprintf(stderr, "count must be >= 1 but got %d\n", count);
+        return -1;
     }
 
     if (prompt.empty() || outpath.empty())
@@ -289,6 +303,7 @@ int main(int argc, char** argv)
     fprintf(stderr, "image-size = %d x %d\n", width, height);
     fprintf(stderr, "steps = %d\n", steps);
     fprintf(stderr, "seed = %d\n", seed);
+    fprintf(stderr, "count = %d\n", count);
     fprintf(stderr, "gpu-id = %d\n", gpuid);
 
     const bool apply_cfg = guidance_scale > 0.f;
@@ -439,23 +454,52 @@ int main(int argc, char** argv)
         t_embedder.process(timesteps, t_embeds);
     }
 
-    // diffusion transformer loop
+    // generate seeds for multi-image
+    std::vector<int> seeds(count);
+    seeds[0] = seed;
+    for (int i = 1; i < count; i++)
     {
-        ZImage::AllXEmbedder all_x_embedder;
+        seeds[i] = seed + (rand() % 10001 - 5000);
+    }
 
-        all_x_embedder.load(model, opt);
+    // load diffusion models
+    ZImage::AllXEmbedder all_x_embedder;
 
-        ZImage::NoiseRefiner noise_refiner;
+    all_x_embedder.load(model, opt);
 
-        noise_refiner.load(model, opt);
+    ZImage::NoiseRefiner noise_refiner;
 
-        ZImage::UnifiedRefiner unified_refiner;
+    noise_refiner.load(model, opt);
 
-        unified_refiner.load(model, opt);
+    ZImage::UnifiedRefiner unified_refiner;
 
-        ZImage::AllFinalLayer all_final_layer;
+    unified_refiner.load(model, opt);
 
-        all_final_layer.load(model, opt);
+    ZImage::AllFinalLayer all_final_layer;
+
+    all_final_layer.load(model, opt);
+
+    // load vae
+    const float vae_scaling_factor = 0.3611f;
+    const float vae_shift_factor = 0.1159f;
+    const bool use_vae_tiled = vae_tile_width < width || vae_tile_height < height;
+
+    ZImage::VAE vae;
+    vae.load(model, use_vae_tiled, opt);
+
+    // diffusion transformer loop
+    for (int img_idx = 0; img_idx < count; img_idx++)
+    {
+        int current_seed = seeds[img_idx];
+        fprintf(stderr, "\n[%d/%d] generating with seed = %d\n", img_idx + 1, count, current_seed);
+
+        // prepare latent
+        ncnn::Mat img_latent;
+        ZImage::generate_latent(width, height, current_seed, img_latent);
+
+        // patchify
+        ncnn::Mat x;
+        ZImage::patchify(img_latent, x);
 
         for (int z = 0; z < steps; z++)
         {
@@ -523,74 +567,92 @@ int main(int argc, char** argv)
                 }
             }
 
-            fprintf(stderr, "step %d done\n", z);
+            fprintf(stderr, "[%d/%d] step %d done\n", img_idx + 1, count, z);
         }
-    }
 
-    // unpatchify
-    ZImage::unpatchify(x, latent);
+        // unpatchify
+        ZImage::unpatchify(x, img_latent);
 
-    // vae decode
-    ncnn::Mat outimage;
-    {
-        const float vae_scaling_factor = 0.3611f;
-        const float vae_shift_factor = 0.1159f;
-
-        for (int i = 0; i < latent.total(); i++)
+        // vae decode
+        for (int i = 0; i < img_latent.total(); i++)
         {
-            latent[i] = latent[i] / vae_scaling_factor + vae_shift_factor;
+            img_latent[i] = img_latent[i] / vae_scaling_factor + vae_shift_factor;
         }
 
-        const bool use_vae_tiled = vae_tile_width < width || vae_tile_height < height;
-
-        ZImage::VAE vae;
-
-        vae.load(model, use_vae_tiled, opt);
-
+        ncnn::Mat outimage;
         if (use_vae_tiled)
         {
-            vae.process_tiled(latent, vae_tile_width, vae_tile_height, outimage);
+            vae.process_tiled(img_latent, vae_tile_width, vae_tile_height, outimage);
         }
         else
         {
-            vae.process(latent, outimage);
+            vae.process(img_latent, outimage);
         }
-    }
 
-    // save image
-    {
-        int success = 0;
-
-        path_t ext = get_file_extension(outpath);
-
-        if (ext == PATHSTR("webp") || ext == PATHSTR("WEBP"))
+        // generate output path for this image
+        path_t img_outpath;
+        if (count == 1)
         {
-            success = webp_save(outpath.c_str(), outimage.w, outimage.h, outimage.elempack, (const unsigned char*)outimage.data);
+            img_outpath = outpath;
         }
-        else if (ext == PATHSTR("png") || ext == PATHSTR("PNG"))
+        else
         {
+            path_t name = get_file_name_without_extension(outpath);
+            path_t ext = get_file_extension(outpath);
 #if _WIN32
-            success = wic_encode_image(outpath.c_str(), outimage.w, outimage.h, outimage.elempack, outimage.data);
+            wchar_t suffix[64];
+            swprintf(suffix, 64, L"-%d.%ls", img_idx, ext.c_str());
+            img_outpath = name + suffix;
 #else
-            success = png_save(outpath.c_str(), outimage.w, outimage.h, outimage.elempack, (const unsigned char*)outimage.data);
-#endif
-        }
-        else if (ext == PATHSTR("jpg") || ext == PATHSTR("JPG") || ext == PATHSTR("jpeg") || ext == PATHSTR("JPEG"))
-        {
-#if _WIN32
-            success = wic_encode_jpeg_image(outpath.c_str(), outimage.w, outimage.h, outimage.elempack, outimage.data);
-#else
-            success = jpeg_save(outpath.c_str(), outimage.w, outimage.h, outimage.elempack, (const unsigned char*)outimage.data);
+            char suffix[64];
+            snprintf(suffix, 64, "-%d.%s", img_idx, ext.c_str());
+            img_outpath = name + suffix;
 #endif
         }
 
-        if (!success)
+        // save image
         {
+            int success = 0;
+
+            path_t ext = get_file_extension(img_outpath);
+
+            if (ext == PATHSTR("webp") || ext == PATHSTR("WEBP"))
+            {
+                success = webp_save(img_outpath.c_str(), outimage.w, outimage.h, outimage.elempack, (const unsigned char*)outimage.data);
+            }
+            else if (ext == PATHSTR("png") || ext == PATHSTR("PNG"))
+            {
 #if _WIN32
-            fwprintf(stderr, L"encode image %ls failed\n", outpath.c_str());
+                success = wic_encode_image(img_outpath.c_str(), outimage.w, outimage.h, outimage.elempack, outimage.data);
 #else
-            fprintf(stderr, "encode image %s failed\n", outpath.c_str());
+                success = png_save(img_outpath.c_str(), outimage.w, outimage.h, outimage.elempack, (const unsigned char*)outimage.data);
 #endif
+            }
+            else if (ext == PATHSTR("jpg") || ext == PATHSTR("JPG") || ext == PATHSTR("jpeg") || ext == PATHSTR("JPEG"))
+            {
+#if _WIN32
+                success = wic_encode_jpeg_image(img_outpath.c_str(), outimage.w, outimage.h, outimage.elempack, outimage.data);
+#else
+                success = jpeg_save(img_outpath.c_str(), outimage.w, outimage.h, outimage.elempack, (const unsigned char*)outimage.data);
+#endif
+            }
+
+            if (!success)
+            {
+#if _WIN32
+                fwprintf(stderr, L"encode image %ls failed\n", img_outpath.c_str());
+#else
+                fprintf(stderr, "encode image %s failed\n", img_outpath.c_str());
+#endif
+            }
+            else
+            {
+#if _WIN32
+                fwprintf(stderr, L"[%d/%d] saved %ls\n", img_idx + 1, count, img_outpath.c_str());
+#else
+                fprintf(stderr, "[%d/%d] saved %s\n", img_idx + 1, count, img_outpath.c_str());
+#endif
+            }
         }
     }
 
