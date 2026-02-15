@@ -365,9 +365,19 @@ void get_optimal_tile_size(int width, int height, int max_tile_area, int* tile_w
     *tile_height = best_th;
 }
 
+static path_t resolve_path(const path_t& root, const path_t& path, const path_t& fallback_path)
+{
+    path_t p = root + path;
+    path_t p_san = sanitize_filepath(p);
+    if (filepath_is_readable(p_san))
+        return p_san;
+
+    return sanitize_filepath(root + fallback_path);
+}
+
 Tokenizer::Tokenizer(const path_t& model) : bpe(BpeTokenizer::LoadFromFiles(
-    sanitize_filepath(model + PATHSTR("/../z-image-turbo/vocab.txt")),
-    sanitize_filepath(model + PATHSTR("/../z-image-turbo/merges.txt")),
+    resolve_path(model, PATHSTR("/vocab.txt"), PATHSTR("/../z-image-turbo/vocab.txt")),
+    resolve_path(model, PATHSTR("/merges.txt"), PATHSTR("/../z-image-turbo/merges.txt")),
     SpecialTokensConfig{}, false, true, true))
 {
     bpe.AddAdditionalSpecialToken("<|endoftext|>");
@@ -411,10 +421,8 @@ int Tokenizer::encode(const path_t& prompt, std::vector<int>& ids) const
 int TextEncoder::load(const path_t& model, const ncnn::Option& opt)
 {
     // share the same text_encoder
-    path_t parampath = model + PATHSTR("/../z-image-turbo/z_image_turbo_text_encoder.ncnn.param");
-    path_t modelpath = model + PATHSTR("/../z-image-turbo/z_image_turbo_text_encoder.ncnn.bin");
-    parampath = sanitize_filepath(parampath);
-    modelpath = sanitize_filepath(modelpath);
+    path_t parampath = resolve_path(model, PATHSTR("/z_image_turbo_text_encoder.ncnn.param"), PATHSTR("/../z-image-turbo/z_image_turbo_text_encoder.ncnn.param"));
+    path_t modelpath = resolve_path(model, PATHSTR("/z_image_turbo_text_encoder.ncnn.bin"), PATHSTR("/../z-image-turbo/z_image_turbo_text_encoder.ncnn.bin"));
 
     text_encoder.opt = opt;
     text_encoder.load_param(parampath.c_str());
@@ -993,10 +1001,8 @@ int VAETiledGroupNorm::forward_inplace(ncnn::Mat& bottom_top_blob, const ncnn::O
 int VAE::load(const path_t& model, bool use_vae_tiled, const ncnn::Option& opt)
 {
     // share the same vae
-    path_t parampath = model + PATHSTR("/../z-image-turbo/z_image_turbo_vae.ncnn.param");
-    path_t modelpath = model + PATHSTR("/../z-image-turbo/z_image_turbo_vae.ncnn.bin");
-    parampath = sanitize_filepath(parampath);
-    modelpath = sanitize_filepath(modelpath);
+    path_t parampath = resolve_path(model, PATHSTR("/z_image_turbo_vae.ncnn.param"), PATHSTR("/../z-image-turbo/z_image_turbo_vae.ncnn.param"));
+    path_t modelpath = resolve_path(model, PATHSTR("/z_image_turbo_vae.ncnn.bin"), PATHSTR("/../z-image-turbo/z_image_turbo_vae.ncnn.bin"));
 
     vae.opt = opt;
     if (use_vae_tiled)
