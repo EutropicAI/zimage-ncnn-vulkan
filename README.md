@@ -68,6 +68,7 @@ Usage: zimage-ncnn-vulkan -p prompt -o outfile [options]...
   -l steps             denoise steps (default=auto)
   -r random-seed       random seed (default=rand)
   -m model-path        z-image model path (default=z-image-turbo)
+  -c count             number of images to generate (default=1)
   -g gpu-id            gpu device to use (-1=cpu, default=auto)
 ```
 
