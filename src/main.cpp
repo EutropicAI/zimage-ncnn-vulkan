@@ -318,6 +318,29 @@ int main(int argc, char** argv)
     opt.use_bf16_storage = gpuid >= 0;
     // opt.use_mapped_model_loading = true;
 
+    ncnn::VkBlobAllocator* blob_vkallocator = 0;
+    ncnn::VkStagingAllocator* staging_vkallocator = 0;
+    ncnn::PoolAllocator* blob_allocator = 0;
+    ncnn::PoolAllocator* workspace_allocator = 0;
+
+    if (opt.use_vulkan_compute)
+    {
+        blob_vkallocator = new ncnn::VkBlobAllocator(ncnn::get_gpu_device(gpuid));
+        staging_vkallocator = new ncnn::VkStagingAllocator(ncnn::get_gpu_device(gpuid));
+
+        opt.blob_vkallocator = blob_vkallocator;
+        opt.workspace_vkallocator = blob_vkallocator;
+        opt.staging_vkallocator = staging_vkallocator;
+    }
+    else
+    {
+        blob_allocator = new ncnn::PoolAllocator;
+        workspace_allocator = new ncnn::PoolAllocator;
+
+        opt.blob_allocator = blob_allocator;
+        opt.workspace_allocator = workspace_allocator;
+    }
+
     // estimate transformer and vae memory usage
     const uint32_t heap_budget = gpuid >= 0 ? ncnn::get_gpu_device(gpuid)->get_heap_budget() : 0;
 
@@ -654,6 +677,28 @@ int main(int argc, char** argv)
 #endif
             }
         }
+
+        if (opt.use_vulkan_compute)
+        {
+            blob_vkallocator->clear();
+            staging_vkallocator->clear();
+        }
+        else
+        {
+            blob_allocator->clear();
+            workspace_allocator->clear();
+        }
+    }
+
+    if (opt.use_vulkan_compute)
+    {
+        delete blob_vkallocator;
+        delete staging_vkallocator;
+    }
+    else
+    {
+        delete blob_allocator;
+        delete workspace_allocator;
     }
 
     return 0;
